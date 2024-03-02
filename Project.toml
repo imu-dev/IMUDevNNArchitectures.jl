@@ -1,0 +1,16 @@
+name = "IMUDevNNArchitectures"
+uuid = "f70ee525-ba1a-4335-97e8-1e95512d282a"
+authors = ["Marcin Mider <marcin.mider@gmail.com> and contributors"]
+version = "0.1.0"
+
+[deps]
+Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+
+[compat]
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
