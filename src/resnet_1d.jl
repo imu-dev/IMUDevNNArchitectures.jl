@@ -1,148 +1,295 @@
 # Reference implementations
-# https://github.com/hsd1503/ResNet1d/blob/master/ResNet1d.py
-# and
-# https://github.com/Sachini/ronin/blob/master/source/model_ResNet1d.py
+# https://github.com/hsd1503/resnet1d/blob/master/resnet1d.py
+# https://github.com/Sachini/ronin/blob/master/source/model_resnet1d.py
 
-struct BasicBlock
-    conv1::Conv
-    bn1::BatchNorm
-    conv2::Conv
-    bn2::BatchNorm
-    downsampler::Union{Chain,Nothing}
-end
+module ResNet1d
 
-Flux.@functor BasicBlock
+using Flux
 
-function BasicBlock(kernel_size::Int, in_out::Pair{Int,Int};
-                    stride::Int=1, pad=kernel_size ÷ 2)
-    in, out = in_out
-    # assertion coming out of construction of ResNet1d
-    @assert (in == out && stride == 1) || (in != out && stride != 1)
+"""
+    inputblock(in_out::Pair{Int,Int})
 
-    has_downsampling = stride != 1
-    downsampler = if has_downsampling
-        Chain(Conv((1,), in_out; stride, bias=false),
-              BatchNorm(out))
-    else
-        nothing
-    end
-    return BasicBlock(Conv((kernel_size,), in_out; stride, pad=(pad,), bias=false),
-                      BatchNorm(out, relu),
-                      Conv((kernel_size,), out => out; pad=(pad,), bias=false),
-                      BatchNorm(out),
-                      downsampler)
-end
-
-function (m::BasicBlock)(x)
-    y = x |> m.conv1 |> m.bn1 |> m.conv2 |> m.bn2
-    if isnothing(m.downsampler)
-        return relu.(x + y)
-    else
-        return relu.(m.downsampler(x) + y)
-    end
-end
-
-struct FCResNetOutput
-    transition::Union{Nothing,Chain}
-    output_layer::Chain
-end
-
-Flux.@functor FCResNetOutput
-
-@kwdef struct FCParams
-    fc_dim::Int = 1024
-    dropout::Float64 = 0.5
-    trans_planes::Int = 0
-end
-
-function FCResNetOutput(in_size::Tuple{Int,Int}, out::Int, θ::FCParams=FCParams())
-    has_transition_layer = θ.trans_planes > 0
-    transition, fc_in = if has_transition_layer
-        Chain(Conv((1,), in_size[1] => θ.trans_planes; bias=false),
-              BatchNorm(θ.trans_planes)), θ.trans_planes * in_size[2]
-    else
-        nothing, prod(in_size)
-    end
-    output_layer = Chain(Dense(fc_in, θ.fc_dim, relu),
-                         Dropout(θ.dropout),
-                         Dense(θ.fc_dim, θ.fc_dim, relu),
-                         Dropout(θ.dropout),
-                         Dense(θ.fc_dim, out))
-    return FCResNetOutput(transition, output_layer)
-end
-
-function (m::FCResNetOutput)(x)
-    if !isnothing(m.transition)
-        x = m.transition(x)
-    end
-    return x |> Flux.flatten |> m.output_layer
-end
-
-function aux_dim(in::Int, strides)
-    return foldl((prev, stride) -> div(prev, stride, RoundUp), strides; init=in)
-end
-
-@kwdef struct ResNet1d
-    input_block::Chain
-    residual_groups::Chain
-    output_block::FCResNetOutput
-end
-
-Flux.@functor ResNet1d
-
-(m::ResNet1d)(x) = x |> m.input_block |> m.residual_groups |> m.output_block
-
-function input_block(::Type{ResNet1d}, in_out::Pair{Int,Int})
+Input block for ResNet1d. It consists of a `convolutional layer`, a `batch
+normalization` layer, and a `max pooling` layer.
+"""
+function inputblock(in_out::Pair{Int,Int})
     _, out = in_out
-    return Chain(Conv((7,), in_out; stride=2, pad=(3,), bias=false),
+    return Chain(Conv((7,), in_out; stride=2, pad=SamePad(), bias=false),
                  BatchNorm(out, relu),
-                 MaxPool((3,); stride=2, pad=(1,)))
+                 MaxPool((3,); stride=2, pad=SamePad()))
 end
 
-function residual_group(kernel_size::Int, in_out::Pair{Int,Int};
-                        group_size::Int, stride::Int=1)
+"""
+    basicblock(kernel_size::Int, in_out::Pair{Int,Int}; stride::Int)
+
+A `basic block` for ResNet1d. It consists of two `convolutional layers` with
+`batch normalization` and a `skip connection`. `ResNet1d` will stack these
+`basic blocks` to form `residual groups` (see also [`residualgroup`](@ref)).
+
+# Arguments
+- `kernel_size::Int`: The size of the kernel for the convolutional layers.
+- `in_out::Pair{Int,Int}`: The input and output channels of the block.
+- `stride::Int`: The stride for the first convolutional layer.
+"""
+function basicblock(kernel_size::Int, in_out::Pair{Int,Int}; stride::Int=1)
     _, out = in_out
-    return Chain(BasicBlock(kernel_size, in_out; stride),
-                 [BasicBlock(kernel_size, out => out) for _ in 2:group_size]...)
+    m = Chain(Conv((kernel_size,), in_out; stride, pad=SamePad(), bias=false),
+              BatchNorm(out, relu),
+              Conv((kernel_size,), out => out; pad=SamePad(), bias=false),
+              BatchNorm(out))
+    if stride > 1
+        ds = downsampler(in_out; stride)
+        return SkipConnection(m, (mx, x) -> relu.(ds(x) + mx))
+    end
+    return SkipConnection(m, (mx, x) -> relu.(mx + x))
 end
 
-function residual_groups(::Type{ResNet1d},
-                         base_plane::Int,
-                         group_sizes;
-                         kernel_size::Int=3)
-    out_planes = base_plane .* (2 .^ (eachindex(group_sizes) .- 1))
-    in_planes = vcat([base_plane], out_planes[1:(end - 1)])
-    strides = out_planes .÷ in_planes
+"""
+    downsampler(in_out::Pair{Int,Int}; stride::Int)
 
-    groups = [residual_group(kernel_size, in => out; group_size, stride)
-              for (in, out, group_size, stride) in
-                  zip(in_planes, out_planes, group_sizes, strides)]
+A downsampler block for ResNet1d's `basic block`. It downsamples the input to a
+size that makes a `skip connection` possible.
 
-    return Chain(groups...), out_planes[end], strides
+# Arguments
+- `in_out::Pair{Int,Int}`: The input and output channels of the ResNet1d's `basic block`.
+- `stride::Int`: The stride for downsampling.
+"""
+function downsampler(in_out::Pair{Int,Int}; stride::Int)
+    stride > 1 || throw(ArgumentError("Stride must be greater than 1 when downsampling"))
+    _, out = in_out
+    return Chain(Conv((1,), in_out; stride, bias=false),
+                 BatchNorm(out))
 end
 
-function ResNet1d(in_size_out::Pair{Tuple{Int,Int},Int}, residual_group_sizes;
-                  base_plane::Int=64, zero_init_residual::Bool=false,
-                  residual_kernel_size::Int=3,
-                  fc_params::FCParams=FCParams())
-    in_size, out = in_size_out
-    b1 = input_block(ResNet1d, in_size[2] => base_plane)
-    b2, last_plane_size, strides = residual_groups(ResNet1d,
-                                                   base_plane,
-                                                   residual_group_sizes;
-                                                   kernel_size=residual_kernel_size)
-    input_block_strides = [2, 2]
-    d = aux_dim(in_size[1], [input_block_strides..., strides...])
-    b3 = FCResNetOutput((last_plane_size, d), out, fc_params)
+"""
+Zero-initialize the last BatchNormalization in each residual branch of the model
+`m`. This improves the model by 0.2~0.3% according to
+https://arxiv.org/abs/1706.02677.
 
-    out = ResNet1d(; input_block=b1,
-                   residual_groups=b2,
-                   output_block=b3)
-    init!(out, zero_init_residual)
-    return out
+!!! warning
+    Current implementation is based on the assumption that all `SkipConnection`s
+    in the model `m` have the same form as the one in `basicblock` and thus
+    have the `BatchNormalization` layer as the fourth layer. If this is not the
+    case, the function will not work as expected.
+"""
+function zero_init!(m::Chain)
+    for mod in Flux.modules(m)
+        if isa(mod, SkipConnection)
+            mod.layers[4].γ .= 0.0
+        end
+    end
 end
 
-function init!(m::ResNet1d, zero_init_residual::Bool)
+"""
+    residualgroup(kernel_size::Int, in_out::Pair{Int,Int};
+                  group_size::Int, stride::Int=1)
+
+Residual group for ResNet1d. It consists of `basic block`s stacked together.
+Only the first `basic block` in the group can have a `stride` greater than 1.
+
+# Arguments
+- `kernel_size::Int`: The size of the kernel in each `basic block`.
+- `in_out::Pair{Int,Int}`: The input and output channels of the group.
+- `group_size::Int`: The number of `basic block`s in the group.
+- `stride::Int`: The stride for the first `basic block` in the group.
+"""
+function residualgroup(kernel_size::Int, in_out::Pair{Int,Int};
+                       group_size::Int, stride::Int=1)
+    _, out = in_out
+    return Chain(basicblock(kernel_size, in_out; stride),
+                 [basicblock(kernel_size, out => out) for _ in 2:group_size]...)
+end
+
+"""
+    in_out_sizes(base_size::Int, schedule::Vector{Int})
+
+Defines the input and output sizes for the `residual groups` in ResNet1d
+by scaling the `base_size` by the `schedule`.
+"""
+function in_out_sizes(base_size::Int, schedule::Vector{Int})
+    out_sizes = base_size .* schedule
+    in_sizes = vcat([base_size], out_sizes[1:(end - 1)])
+    return [in => out for (in, out) in zip(in_sizes, out_sizes)]
+end
+
+"""
+    incrpow2_schedule(num_groups::Int)
+
+Defines the `schedule` for the sizes of the `residual groups` in ResNet1d as
+increasing powers of 2.
+"""
+function incrpow2_schedule(num_groups::Int)
+    num_groups > 0 || throw(ArgumentError("Number of groups must be greater than 0"))
+    return 2 .^ (collect(1:num_groups) .- 1)
+end
+
+"""
+residualblock(base_plane::Int, group_sizes, strides; kernel_size::Int=3)
+
+Defines the `residual block` for ResNet1d. It consists of `residual group`s
+stacked together.
+
+# Arguments
+- `base_plane::Int`: Hyperparameter based on which the number of channels
+  in each `residual group` is going to be computed.
+- `group_sizes`: The number of `basic block`s in each `residual group`.
+- `strides`: The stride for the first `basic block` in each `residual group`.
+- `kernel_size::Int`: The size of the kernel in each `basic block`.
+"""
+function residualblock(base_plane::Int, group_sizes, strides; kernel_size::Int=3)
+    in_outs = in_out_sizes(base_plane, incrpow2_schedule(length(group_sizes)))
+
+    groups = [residualgroup(kernel_size, in_out; group_size, stride)
+              for (in_out, group_size, stride) in zip(in_outs, group_sizes, strides)]
+
+    return Chain(groups...)
+end
+
+function out_num_channels(residualblock::Chain)
+    last_residualgroup = residualblock[end]
+    last_basicblock = last_residualgroup[end]
+    last_batchnorm_layer = last_basicblock.layers[end]
+    num_channels = last_batchnorm_layer.chs
+    return num_channels
+end
+
+"""
+    transition_layer(in_out::Pair{Int,Int})
+
+Transition layer for ResNet1d that can be stuck between the `residual block`
+and an `output layer`. It consists of a `convolutional layer` and a
+`batch normalization` layer.
+"""
+function transition_layer(in_out::Pair{Int,Int})
+    _, out = in_out
+    return Chain(Conv((1,), in_out; bias=false),
+                 BatchNorm(out))
+end
+
+"""
+    output_layer(in_out::Pair{Int,Int};
+                 hidden::Int=1024,
+                 dropout::Float64=0.5)
+            
+Output layer for ResNet1d. `hidden` is the size of the fully connected hidden
+layers.
+"""
+function output_layer(in_out::Pair{Int,Int};
+                      hidden::Int=1024,
+                      dropout::Float64=0.5)
+    in, out = in_out
+    return Chain(Flux.MLUtils.flatten,
+                 Dense(in, hidden, relu),
+                 Dropout(dropout),
+                 Dense(hidden, hidden, relu),
+                 Dropout(dropout),
+                 Dense(hidden, out))
+end
+
+"""
+    outputblock(in_out::Pair{Tuple{Int,Int},Int};
+                hidden::Int=1024,
+                dropout::Float64=0.5,
+                transition_size::Int=0)
+
+Output block for ResNet1d. It can have a `transition layer` between the
+`residual block` and the `output layer`.
+
+# Arguments
+- `in_out::Pair{Tuple{Int,Int},Int}`: The input and output sizes of the block.
+- `hidden::Int`: The size of the fully connected hidden layers in the `output layer`.
+- `dropout::Float64`: The dropout rate for the `output layer`.
+- `transition_size::Int`: The size of the `transition layer`.
+
+!!! note
+    The `in_out` has a format `(num_channels, time_dim) => output_dim`.
+"""
+function outputblock(in_out::Pair{Tuple{Int,Int},Int};
+                     hidden::Int=1024,
+                     dropout::Float64=0.5,
+                     transition_size::Int=0)
+    in, out = in_out
+
+    if transition_size > 0
+        return Chain(transition_layer(in[1] => transition_size),
+                     output_layer(transition_size * in[2] => out;
+                                  hidden,
+                                  dropout))
+    end
+    return output_layer(prod(in) => out; hidden, dropout)
+end
+
+"""
+    resnet(in_out::Pair{Tuple{Int,Int},Int}, group_sizes;
+           strides=vcat([1], fill(2, length(group_sizes) - 1)),
+           base_plane::Int=64, kernel_size::Int=3,
+           outputblock_builder=(in_out) -> outputblock(in_out;
+                                                       hidden=1024,
+                                                       dropout=0.5,
+                                                       transition_size=0))
+
+ResNet1d model (see the
+[original ResNet publication](https://arxiv.org/abs/1512.03385)). It consists of
+an `input block`, a `residual block`, and an `output block`. The
+`residual block` is defined by the `group_sizes`, `strides`, `base_plane` and
+`kernel_size`. The `output block` is often custom built, but a default one is
+provided. `in_out` argument in the `outputblock_builder` is a pair of the form
+`(num_channels, time_dim) => output_dim`.
+
+# Arguments
+- `in_out::Pair{Tuple{Int,Int},Int}`: The input and output sizes of the model.
+- `group_sizes`: The number of `basic block`s in each `residual group`.
+- `strides`: The stride for the first `basic block` in each `residual group`.
+- `base_plane::Int`: Hyperparameter based on which the number of channels
+  in each `residual group` is going to be computed.
+- `kernel_size::Int`: The size of the kernel in each `basic block`.
+- `outputblock_builder`: A function that builds the `output block` of the model.
+
+!!! note
+    The `in_out` has a format `(num_channels, time_dim) => output_dim`.
+"""
+function resnet(in_out::Pair{Tuple{Int,Int},Int}, group_sizes;
+                strides=vcat([1], fill(2, length(group_sizes) - 1)),
+                base_plane::Int=64, kernel_size::Int=3,
+                outputblock_builder=(in_out) -> outputblock(in_out;
+                                                            hidden=1024,
+                                                            dropout=0.5,
+                                                            transition_size=0))
+    in, out = in_out
+
+    b1 = inputblock(in[2] => base_plane)
+    b2 = residualblock(base_plane, group_sizes, strides; kernel_size)
+
+    inputblock_strides = [2, 2]
+    time_dim = compute_time_dimension(in[1], [inputblock_strides..., strides...])
+    num_channels = out_num_channels(b2)
+    b3 = outputblock_builder((num_channels, time_dim) => out)
+
+    return Chain(b1, b2, b3)
+end
+
+"""
+    compute_time_dimension(starting::Int, strides)
+
+Compute the time dimension of the output tensor given the starting time
+dimension and the strides of the layers in the model.
+"""
+function compute_time_dimension(starting::Int, strides)
+    return foldl((prev, stride) -> div(prev, stride, RoundUp), strides;
+                 init=starting)
+end
+
+"""
+    init!(m::Chain)
+
+Initialize the weights and biases of the resnet model `m`.
+
+!!! note
+    If you'd like to zero initialize the weights of the last `BatchNormalization`
+    in each residual branch of the model, use the function [`zero_init!`](@ref)
+    after calling this function.
+"""
+function init!(m::Chain)
     for mod in Flux.modules(m)
         if isa(mod, Conv)
             mod.weight .= Flux.kaiming_normal(size(mod.weight)...)
@@ -154,16 +301,10 @@ function init!(m::ResNet1d, zero_init_residual::Bool)
             mod.bias .= 0.0
         end
     end
-
-    # Zero-initialize the last BN in each residual branch,
-    # so that the residual branch starts with zeros, and each residual block behaves like an identity.
-    # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
-    if zero_init_residual
-        for mod in Flux.modules(m)
-            if isa(mod, BasicBlock)
-                mod.bn2.γ .= 0.0
-            end
-        end
-    end
     return nothing
+end
+
+# Export only the main function
+export resnet
+
 end
