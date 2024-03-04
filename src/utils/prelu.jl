@@ -15,24 +15,33 @@ where `α` is a learnable parameter.
 # Example
 
 ```julia
-using Flux
+using Lux
 using IMUDevNNArchitectures
 
-model = Chain(
-    Dense(10, 5),
-    PReLU(0.25f0),
-    Dense(5, 2),
-    softmax)
+model = Chain(Dense(10 => 5),
+              PReLU(0.25f0),
+              Dense(5 => 2),
+              softmax)
 ```
 """
-struct PReLU{T}
-    α::Vector{T}
+struct PReLU{F} <: Lux.AbstractExplicitLayer
+    init_α::F
 end
 
-Flux.@functor PReLU
+function PReLU(α::Real=0.25f0)
+    λ() = α / 1
+    return PReLU{typeof(λ)}(λ)
+end
 
-PReLU(α::Real=0.25f0) = PReLU([α / 1])
+l = PReLU(0.25f0)
 
-prelu(x, α) = max.(0, x) .+ α .* min.(0, x)
+Lux.initialparameters(::AbstractRNG, l::PReLU) = (; α=l.init_α())
+Lux.initialstates(::AbstractRNG, l::PReLU) = NamedTuple()
 
-(act::PReLU)(x) = prelu(x, act.α)
+Lux.parameterlength(::PReLU) = 1
+Lux.statelength(::PReLU) = 0
+
+function (l::PReLU)(x::AbstractArray, ps, st::NamedTuple)
+    y = max.(0, x) .+ ps.α .* min.(0, x)
+    return y, st
+end

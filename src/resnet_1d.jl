@@ -4,7 +4,8 @@
 
 module ResNet1d
 
-using Flux
+using Lux
+using ..IMUDevNNArchitectures: applywhere!
 
 """
     inputblock(in_out::Pair{Int,Int})
@@ -14,7 +15,7 @@ normalization` layer, and a `max pooling` layer.
 """
 function inputblock(in_out::Pair{Int,Int})
     _, out = in_out
-    return Chain(Conv((7,), in_out; stride=2, pad=SamePad(), bias=false),
+    return Chain(Conv((7,), in_out; stride=2, pad=SamePad(), use_bias=false),
                  BatchNorm(out, relu),
                  MaxPool((3,); stride=2, pad=SamePad()))
 end
@@ -33,15 +34,15 @@ A `basic block` for ResNet1d. It consists of two `convolutional layers` with
 """
 function basicblock(kernel_size::Int, in_out::Pair{Int,Int}; stride::Int=1)
     _, out = in_out
-    m = Chain(Conv((kernel_size,), in_out; stride, pad=SamePad(), bias=false),
+    m = Chain(Conv((kernel_size,), in_out; stride, pad=SamePad(), use_bias=false),
               BatchNorm(out, relu),
-              Conv((kernel_size,), out => out; pad=SamePad(), bias=false),
-              BatchNorm(out))
+              Conv((kernel_size,), out => out; pad=SamePad(), use_bias=false),
+              BatchNorm(out); name="basicblock_main")
+    act = WrappedFunction(Base.Fix1(broadcast, relu))
     if stride > 1
-        ds = downsampler(in_out; stride)
-        return SkipConnection(m, (mx, x) -> relu.(ds(x) + mx))
+        return Chain(Parallel(+, m, downsampler(in_out; stride)), act)
     end
-    return SkipConnection(m, (mx, x) -> relu.(mx + x))
+    return Chain(SkipConnection(m, +), act)
 end
 
 """
@@ -57,27 +58,22 @@ size that makes a `skip connection` possible.
 function downsampler(in_out::Pair{Int,Int}; stride::Int)
     stride > 1 || throw(ArgumentError("Stride must be greater than 1 when downsampling"))
     _, out = in_out
-    return Chain(Conv((1,), in_out; stride, bias=false),
+    return Chain(Conv((1,), in_out; stride, use_bias=false),
                  BatchNorm(out))
 end
 
 """
+    zero_init!(model::Chain, parameters)
+    
 Zero-initialize the last BatchNormalization in each residual branch of the model
 `m`. This improves the model by 0.2~0.3% according to
 https://arxiv.org/abs/1706.02677.
-
-!!! warning
-    Current implementation is based on the assumption that all `SkipConnection`s
-    in the model `m` have the same form as the one in `basicblock` and thus
-    have the `BatchNormalization` layer as the fourth layer. If this is not the
-    case, the function will not work as expected.
 """
-function zero_init!(m::Chain)
-    for mod in Flux.modules(m)
-        if isa(mod, SkipConnection)
-            mod.layers[4].γ .= 0.0
-        end
-    end
+function zero_init!(model::Chain, parameters)
+    return applywhere!(parameters,
+                       model;
+                       apply=(ps, m) -> ps.layer_4.scale .= 0.0,
+                       where=(m) -> hasproperty(m, :name) && m.name == "basicblock_main")
 end
 
 """
@@ -146,8 +142,7 @@ function residualblock(base_plane::Int, group_sizes, strides; kernel_size::Int=3
 end
 
 function out_num_channels(residualblock::Chain)
-    last_residualgroup = residualblock[end]
-    last_basicblock = last_residualgroup[end]
+    last_basicblock = residualblock[end - 1]
     last_batchnorm_layer = last_basicblock.layers[end]
     num_channels = last_batchnorm_layer.chs
     return num_channels
@@ -162,7 +157,7 @@ and an `output layer`. It consists of a `convolutional layer` and a
 """
 function transition_layer(in_out::Pair{Int,Int})
     _, out = in_out
-    return Chain(Conv((1,), in_out; bias=false),
+    return Chain(Conv((1,), in_out; use_bias=false),
                  BatchNorm(out))
 end
 
@@ -178,7 +173,7 @@ function output_layer(in_out::Pair{Int,Int};
                       hidden::Int=1024,
                       dropout::Float64=0.5)
     in, out = in_out
-    return Chain(Flux.MLUtils.flatten,
+    return Chain(FlattenLayer(),
                  Dense(in, hidden, relu),
                  Dropout(dropout),
                  Dense(hidden, hidden, relu),
@@ -277,31 +272,6 @@ dimension and the strides of the layers in the model.
 function compute_time_dimension(starting::Int, strides)
     return foldl((prev, stride) -> div(prev, stride, RoundUp), strides;
                  init=starting)
-end
-
-"""
-    init!(m::Chain)
-
-Initialize the weights and biases of the resnet model `m`.
-
-!!! note
-    If you'd like to zero initialize the weights of the last `BatchNormalization`
-    in each residual branch of the model, use the function [`zero_init!`](@ref)
-    after calling this function.
-"""
-function init!(m::Chain)
-    for mod in Flux.modules(m)
-        if isa(mod, Conv)
-            mod.weight .= Flux.kaiming_normal(size(mod.weight)...)
-        elseif isa(mod, BatchNorm)
-            mod.γ .= 1.0
-            mod.β .= 0.0
-        elseif isa(mod, Dense)
-            mod.weight .= randn(Float32, size(mod.weight)) .* 0.01f0
-            mod.bias .= 0.0
-        end
-    end
-    return nothing
 end
 
 # Export only the main function

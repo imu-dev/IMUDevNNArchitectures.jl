@@ -4,7 +4,7 @@
 
 module TCN
 
-using Flux
+using Lux
 using ..IMUDevNNArchitectures: PReLU
 
 """
@@ -16,14 +16,6 @@ Create a Temporal Convolutional Network (TCN) model. The model is a chain of
 `channels` vector. The first layer has input size `first(in_out)` and output
 size `channels[1]`. The last layer has input size `channels[end]` and output
 size `last(in_out)`.
-
-!!! warning
-    The original implementation `https://github.com/locuslab/TCN` uses a
-    technique called [Weight Normalization](https://arxiv.org/abs/1602.07868);
-    however, as of today [`Flux.jl`](https://github.com/FluxML/Flux.jl) does not
-    implement this (see also
-    [this issue](https://github.com/FluxML/Flux.jl/pull/2053)).
-
 """
 function tcn(in_out::Pair{Int,Int};
              channels::AbstractVector{Int}=[],
@@ -45,11 +37,11 @@ function tcnblock(in_out::Pair{Int,Int};
     # chomping. The latter is simpler and requires less allocations.
     _in, out = in_out
     pad = ((kernel_size - 1) * dilation, 0)
-    main = Chain(Conv((kernel_size,), in_out; dilation, pad),
+    main = Chain(WeightNorm(Conv((kernel_size,), in_out; dilation, pad), (:weight,)),
                  BatchNorm(out),
                  PReLU(),
                  Dropout(dropout),
-                 Conv((kernel_size,), out => out; dilation, pad),
+                 WeightNorm(Conv((kernel_size,), out => out; dilation, pad), (:weight,)),
                  BatchNorm(out),
                  PReLU(),
                  Dropout(dropout))

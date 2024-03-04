@@ -6,7 +6,7 @@ makedocs(; sitename="IMUDevNNArchitectures",
          modules=[IMUDevNNArchitectures],
          checkdocs=:exports,
          pages=["Home" => "index.md",
-                "Manual" => ["Foreword" => joinpath("pages", "general_note.md"),
+                "Manual" => ["Classification" => joinpath("pages", "classification.md"),
                              "ResNet" => joinpath("pages", "resnet.md"),
                              "TCN" => joinpath("pages", "tcn.md"),
                              "utilities" => joinpath("pages", "utils.md")]])
@@ -17,4 +17,4 @@ makedocs(; sitename="IMUDevNNArchitectures",
 #=deploydocs(
     repo = "<repository url>"
 )=#
-deploydocs(; repo="github.com/imu-dev/IMUDevNNArchitectures.jl.git")
+# deploydocs(; repo="github.com/imu-dev/IMUDevNNArchitectures.jl.git")

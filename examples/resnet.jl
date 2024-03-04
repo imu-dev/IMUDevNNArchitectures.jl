@@ -1,7 +1,12 @@
 using Pkg
 Pkg.activate(joinpath(homedir(), ".julia", "dev", "IMUDevNNArchitectures", "examples"))
+using Lux
 using IMUDevNNArchitectures
 using IMUDevNNArchitectures.ResNet1d
+using Random
+
+rng = Random.default_rng()
+Random.seed!(rng, 0)
 
 models = (a=resnet((200, 6) => 2, [2, 2, 2, 2];
                    strides=[1, 2, 2, 2],
@@ -31,6 +36,12 @@ batchsize = 32
 input = rand(Float32, numtimepoints, numfeatures, batchsize)
 
 # pass input through a model to see if layer sizes go well together
-models.a(input)
-models.b(input)
-models.c(input)
+ps, st = Lux.setup(rng, models.a)
+ResNet1d.zero_init!(models.a, ps)
+models.a(input, ps, st)
+
+ps, st = Lux.setup(rng, models.b)
+models.b(input, ps, st)
+
+ps, st = Lux.setup(rng, models.c)
+models.c(input, ps, st)
